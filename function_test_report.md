@@ -38,7 +38,14 @@
 
 > 完整重现代码见 [`repros/02-fs9-read-binary-null/`](repros/02-fs9-read-binary-null/)
 
-**解决方案**：改为将 xlsx 二进制以 BYTEA 格式存储在 PostgreSQL 表中，通过 SQL `encode(data, 'base64')` 读取。
+**解决方案**：PR #859 新增了 `ctx.fs9.readBase64(path)`，返回 base64 编码的文件内容，可处理任意二进制文件：
+
+```javascript
+const b64 = await ctx.fs9.readBase64("/uploads/file.xlsx");
+const buf = Buffer.from(b64, "base64");
+```
+
+注：这是 base64 绕道方案，有约 33% 的体积开销。原生二进制 API 的提案见 [issue #870](https://github.com/c4pt0r/db9-backend/issues/870)。
 
 ---
 
@@ -48,17 +55,7 @@
 
 > 完整重现代码见 [`repros/03-fs9-read-bytea-secdef/`](repros/03-fs9-read-bytea-secdef/)
 
-**解决方案**：将 xlsx 数据存在 `xlsx_staging` BYTEA 表中（admin 授权 authenticated 可读写），完全绕过 `fs9_read_bytea`：
-
-```bash
-# 上传 xlsx
-B64=$(base64 < file.xlsx)
-db9 db sql myapp -q "
-  INSERT INTO xlsx_staging (name, data)
-  VALUES ('file.xlsx', decode('$B64', 'base64'))
-  ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data
-"
-```
+**与当前方案的关系**：最终方案完全不使用 `fs9_read_bytea`，通过 `ctx.fs9.readBase64()` 直接读取文件，此问题不再适用。
 
 ---
 
@@ -102,7 +99,7 @@ const b64 = r.rows[0][0];
 
 **问题**：`<sheet name="Sales" r:id="rId1"/>` 是自闭合标签，初始正则只匹配 `<tag>...</tag>`，导致解析到 0 个工作表，函数"成功"但输出为空。
 
-**解决方案**：`matchTags()` 同时匹配自闭合和非自闭合（见 `src/index.ts`）。
+**解决方案**：`matchTags()` 同时匹配自闭合和非自闭合（见 `src/index-fs9.ts`）。
 
 ---
 
@@ -112,45 +109,22 @@ const b64 = r.rows[0][0];
 
 > 完整重现代码见 [`repros/01-fs9-write-missing-content/`](repros/01-fs9-write-missing-content/)
 
-**解决方案**：将 CSV 输出写入 PostgreSQL 表而非文件系统：
+**根本原因**：function-service 的 WebSocket 消息字段名错误，发送的是 `data` 而服务端期望 `content`（见 issue #867）。
 
-```sql
-CREATE TABLE csv_output (
-  source_name TEXT,
-  sheet_name  TEXT,
-  csv_content TEXT,
-  created_at  TIMESTAMPTZ DEFAULT NOW(),
-  PRIMARY KEY (source_name, sheet_name)
-);
-GRANT ALL ON csv_output TO authenticated;
-```
-
-```javascript
-await ctx.db.query(
-  `INSERT INTO csv_output (source_name, sheet_name, csv_content)
-   VALUES ($1, $2, $3)
-   ON CONFLICT (source_name, sheet_name)
-   DO UPDATE SET csv_content = EXCLUDED.csv_content, created_at = NOW()`,
-  [fileName, sheetName, csvContent]
-);
-```
+**解决方案**：PR #869 修复了字段名，`ctx.fs9.write(path, content)` 现在正常工作。
 
 ---
 
 ## 最终架构
-
-### 方案 A：fs9 直接文件访问（推荐，`src/index-fs9.ts`）
-
-PRs #859 和 #869 修复了 `ctx.fs9.write` 和 `ctx.fs9.readBase64` 后，可以完全绕过 SQL，直接操作 db9 文件系统。
 
 ```
 db9 fs cp file.xlsx myapp:/uploads/
           │
           ▼
    /uploads/file.xlsx   (db9 fs9 filesystem)
-          │  ctx.fs9.readBase64()  ← base64 绕道（Bug 11）
+          │  ctx.fs9.readBase64()
           ▼
-xlsx-csv function (db9 serverless, 7.5 KB bundle)
+xlsx-csv function  (src/index-fs9.ts, 7.5 KB bundle)
   readZip() → parseWorkbook() → parseWorksheet() → toCsv()
           │  ctx.fs9.write()
           ▼
@@ -161,81 +135,22 @@ db9 fs cp myapp:/output/file_Sheet.csv ./
 ```
 
 ```bash
-# 1. 部署函数
+# 部署
 npm run build
-cat dist/index-fs9.js | db9 functions create xlsx-csv \
+cat dist/index.js | db9 functions create xlsx-csv \
   --database myapp \
   --fs9-scope /uploads:ro \
   --fs9-scope /output:rw
 
-# 2. 上传 xlsx
+# 上传
 db9 fs cp your_file.xlsx myapp:/uploads/your_file.xlsx
 
-# 3. 转换
+# 转换
 db9 functions invoke xlsx-csv --database myapp \
   --payload '{"name": "your_file.xlsx"}'
-# → {"converted":[{"source":"your_file.xlsx","sheet":"Sales","path":"/output/your_file_Sales.csv","rows":6,"cols":5}],"errors":[]}
 
-# 4. 下载 CSV
+# 下载
 db9 fs cp myapp:/output/your_file_Sales.csv ./
-```
-
----
-
-### 方案 B：SQL BYTEA 表（备用，`src/index.ts`）
-
-在 `ctx.fs9.write` / `ctx.fs9.readBase64` 不可用时的绕道方案。
-
-```
-本地 xlsx 文件
-  │  base64 编码后 INSERT
-  ▼
-xlsx_staging 表 (BYTEA)
-  │  ctx.db.query("SELECT encode(data,'base64') ...")
-  ▼
-xlsx-csv function (db9 serverless, 7.5 KB bundle)
-  readZip() → parseWorkbook() → parseWorksheet() → toCsv()
-  ▼
-csv_output 表 (TEXT)
-  │  db9 db sql -q "SELECT csv_content FROM csv_output WHERE ..."
-  ▼
-用户下载 CSV
-```
-
-```bash
-# 1. 创建表
-db9 db sql myapp -q "
-  CREATE TABLE IF NOT EXISTS xlsx_staging (
-    name TEXT PRIMARY KEY, data BYTEA, uploaded_at TIMESTAMPTZ DEFAULT NOW()
-  );
-  GRANT ALL ON xlsx_staging TO authenticated;
-  CREATE TABLE IF NOT EXISTS csv_output (
-    source_name TEXT, sheet_name TEXT, csv_content TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(), PRIMARY KEY (source_name, sheet_name)
-  );
-  GRANT ALL ON csv_output TO authenticated;
-"
-
-# 2. 上传 xlsx
-B64=$(base64 < your_file.xlsx)
-db9 db sql myapp -q "
-  INSERT INTO xlsx_staging (name, data)
-  VALUES ('your_file.xlsx', decode('$B64', 'base64'))
-  ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, uploaded_at = NOW()
-"
-
-# 3. 部署函数
-npm run build
-cat dist/index.js | db9 functions create xlsx-csv-sql --database myapp
-
-# 4. 转换
-db9 functions invoke xlsx-csv-sql --database myapp \
-  --payload '{"name":"your_file.xlsx"}'
-
-# 5. 下载 CSV
-db9 db sql myapp --output raw \
-  -q "SELECT csv_content FROM csv_output WHERE source_name='your_file.xlsx' AND sheet_name='Sales'" \
-  > output.csv
 ```
 
 ---
@@ -261,7 +176,7 @@ db9 db sql myapp --output raw \
 
 **期望行为**：`ctx.fs9.write(path, content)` 在函数的 fs9 作用域中创建或更新文件。
 
-**临时 Workaround**：将输出写入数据库表（见最终架构）。
+**修复**：PR #869 修复了 WebSocket 消息字段名（`data` → `content`），`ctx.fs9.write` 现在正常工作。
 
 ---
 
@@ -403,16 +318,11 @@ cp: /functions/<id>/file.txt: connection error: IO error: Connection refused (os
 | 功能 | 状态 | 备注 |
 |------|------|------|
 | 函数部署（小 bundle ≤ ~100KB）| ✅ 正常 | |
-| `ctx.db.query` SELECT / INSERT | ✅ 正常 | 行为数组（Bug 4）|
 | `ctx.fs9.list()` | ✅ 正常 | 返回绝对路径（Bug 5）|
 | `ctx.fs9.read()` 文本文件 | ✅ 正常 | |
-| `ctx.fs9.read()` 二进制文件 | ❌ 返回 null | Bug 2（设计限制，见 Bug 11）|
-| `ctx.fs9.readBase64()` 二进制文件 | ✅ 正常 | PR #869 修复；base64 绕道（Bug 11）|
+| `ctx.fs9.read()` 二进制文件 | ❌ 返回 null | 设计限制，见 Bug 11 |
+| `ctx.fs9.readBase64()` 二进制文件 | ✅ 正常 | PR #869 修复；base64 开销见 Bug 11 |
 | `ctx.fs9.write()` | ✅ 正常 | PR #869 修复（原 Bug 1）|
-| `fs9_read_bytea`（superuser SQL）| ✅ 正常 | |
-| `fs9_read_bytea`（authenticated）| ❌ 权限拒绝 | Bug 3 |
-| `fs9_read_bytea`（SECURITY DEFINER）| ❌ 权限拒绝 | Bug 3 |
 | `db9 functions update` | ✅ 正常 | PR #862 修复（原 Bug 6）|
 | `db9 fs cp /dev/stdin` | ✅ 正常 | PR #862 修复（原 Bug 10）|
-| xlsx → CSV（fs9 方式）| ✅ **正常** | `src/index-fs9.ts`，staging 验证通过 |
-| xlsx → CSV（SQL 方式）| ✅ 正常 | `src/index.ts`，备用方案 |
+| xlsx → CSV 端到端 | ✅ **正常** | `src/index-fs9.ts`，staging 验证通过 |

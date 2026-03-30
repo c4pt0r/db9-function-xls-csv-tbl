@@ -1,11 +1,9 @@
 {
   "name": "db9-function-xls-csv-tbl",
   "version": "1.0.0",
-  "description": "db9 function: convert xlsx files in a folder to CSV",
+  "description": "db9 function: convert xlsx files to CSV via fs9",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/index.js",
-    "deploy": "npm run build && cd dist && db9 functions create xlsx-to-csv",
-    "deploy:update": "npm run build && cd dist && db9 functions create xlsx-to-csv"
+    "build": "esbuild src/index-fs9.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/index.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

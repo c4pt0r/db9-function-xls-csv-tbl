@@ -1,148 +1,84 @@
 # db9 Function: xlsx → CSV
 
-A db9 serverless function that converts Excel (`.xlsx`) files to CSV, one CSV per worksheet.
+A db9 serverless function that converts Excel (`.xlsx`) files to CSV.
 
-- **Zero runtime dependencies** — pure Node.js built-ins (`zlib` only), 7.5 KB bundle
-- **Multi-sheet support** — each worksheet becomes a separate CSV file
-- **Direct fs9 access** — reads from `/uploads/`, writes to `/output/` via `ctx.fs9`
+- One CSV per worksheet
+- Zero dependencies — uses only Node.js built-ins, 7.5 KB bundle
+- Reads from `/uploads/`, writes to `/output/` via `ctx.fs9`
 
-## Prerequisites
-
-- [`db9` CLI](https://db9.ai) installed and authenticated
-- A db9 database (example: `myapp`)
-- Node.js + npm (for building)
-
-## Build
+## Quickstart
 
 ```bash
-npm install
-npm run build
-# → dist/index-fs9.js  (~7.5 KB)
-```
+# Build
+npm install && npm run build
 
-## Deploy
-
-```bash
-cat dist/index-fs9.js | db9 functions create xlsx-csv \
+# Deploy
+cat dist/index.js | db9 functions create xlsx-csv \
   --database myapp \
   --fs9-scope /uploads:ro \
   --fs9-scope /output:rw
-```
 
-- `--fs9-scope /uploads:ro` — function can read from `/uploads/` (read-only)
-- `--fs9-scope /output:rw` — function can write to `/output/` (read-write)
+# Upload a file
+db9 fs cp report.xlsx myapp:/uploads/report.xlsx
 
-To redeploy after code changes:
-
-```bash
-npm run build
-cat dist/index-fs9.js | db9 functions update xlsx-csv --database myapp
-```
-
-## Usage
-
-### 1. Upload an xlsx file
-
-```bash
-db9 fs cp your_file.xlsx myapp:/uploads/your_file.xlsx
-```
-
-### 2. Convert
-
-Convert a single file:
-
-```bash
+# Convert
 db9 functions invoke xlsx-csv --database myapp \
-  --payload '{"name": "your_file.xlsx"}'
+  --payload '{"name": "report.xlsx"}'
+
+# Download results
+db9 fs cp myapp:/output/report_Sheet1.csv ./
 ```
 
-Convert all xlsx files in `/uploads/`:
+## Input
 
-```bash
-db9 functions invoke xlsx-csv --database myapp \
-  --payload '{"all": true}'
-```
+| Field  | Type    | Description |
+|--------|---------|-------------|
+| `name` | string  | Filename under `/uploads/` to convert |
+| `all`  | boolean | Convert all `.xlsx` files in `/uploads/` |
 
-Example output:
+## Output
 
 ```json
 {
   "converted": [
-    { "source": "your_file.xlsx", "sheet": "Sales",     "path": "/output/your_file_Sales.csv",     "rows": 6, "cols": 5 },
-    { "source": "your_file.xlsx", "sheet": "Inventory", "path": "/output/your_file_Inventory.csv", "rows": 5, "cols": 4 }
+    { "source": "report.xlsx", "sheet": "Sheet1", "path": "/output/report_Sheet1.csv", "rows": 6, "cols": 5 }
   ],
   "errors": []
 }
 ```
 
-### 3. Download CSVs
+If the file has only one sheet, the output is named `report.csv` (no sheet suffix).
+
+## Update after code changes
 
 ```bash
-db9 fs cp myapp:/output/your_file_Sales.csv ./your_file_Sales.csv
-db9 fs cp myapp:/output/your_file_Inventory.csv ./your_file_Inventory.csv
+npm run build
+cat dist/index.js | db9 functions update xlsx-csv --database myapp
 ```
-
-List all output files:
-
-```bash
-db9 fs ls myapp:/output/
-```
-
-## Input payload
-
-| Field  | Type    | Description |
-|--------|---------|-------------|
-| `name` | string  | Filename under `/uploads/` to convert (e.g. `"report.xlsx"`) |
-| `all`  | boolean | Convert all `.xlsx` files found in `/uploads/` |
-
-One of `name` or `all` is required.
 
 ## How it works
 
 ```
 db9 fs cp file.xlsx myapp:/uploads/
-          │
-          ▼
-   /uploads/file.xlsx   (db9 fs9 filesystem)
-          │  ctx.fs9.readBase64()
-          ▼
-  xlsx-csv function
-  ├── readZip()           parse ZIP central directory
-  ├── parseSharedStrings() decode OOXML shared string table
-  ├── parseWorksheet()    extract rows and cells per sheet
-  └── toCsv()            format as RFC 4180 CSV
-          │  ctx.fs9.write()
-          ▼
-   /output/file_Sheet.csv  (db9 fs9 filesystem)
-          │
-          ▼
+                │
+                │ ctx.fs9.readBase64()
+                ▼
+        xlsx-csv function
+        ├─ parse ZIP (central directory)
+        ├─ parse OOXML (workbook, shared strings, worksheets)
+        └─ format CSV (RFC 4180)
+                │
+                │ ctx.fs9.write()
+                ▼
+        /output/file_Sheet.csv
+                │
+                ▼
 db9 fs cp myapp:/output/file_Sheet.csv ./
 ```
 
-> **Note on binary reads**: `ctx.fs9.read()` returns UTF-8 strings and cannot handle
-> binary files. The function uses `ctx.fs9.readBase64()` instead, which encodes the
-> file content as base64 (~33% overhead). A native binary read API (`readBinary()`)
-> would be more efficient — see [issue #870](https://github.com/c4pt0r/db9-backend/issues/870).
+## Notes
 
-## Source files
-
-| File | Description |
-|------|-------------|
-| `src/index-fs9.ts` | Main function — pure fs9 I/O, no SQL |
-| `src/index.ts` | Alternative — SQL-based I/O (BYTEA table workaround, pre-fs9 fix) |
-| `repros/` | Reproduction scripts for 11 bugs found during development |
-| `function_test_report.md` | Full test report with bug details |
-
-## Development notes and bugs found
-
-See [`function_test_report.md`](function_test_report.md) for a detailed account of 11 bugs
-encountered during development, including root causes, workarounds, and links to filed issues.
-
-Quick summary of resolved issues relevant to this function:
-
-| Issue | Status |
-|-------|--------|
-| `ctx.fs9.write()` "missing content" ([#867](https://github.com/c4pt0r/db9-backend/issues/867)) | Fixed in PR #869 |
-| `ctx.fs9.readBase64()` returning null ([#859](https://github.com/c4pt0r/db9-backend/pull/859)) | Fixed in PR #869 |
-| `db9 functions update` missing ([repro](repros/06-no-functions-update/README.md)) | Fixed in PR #862 |
-| `db9 fs cp /dev/stdin` intermittent failure ([repro](repros/10-fs-cp-stdin-unstable/README.md)) | Fixed in PR #862 |
+- `ctx.fs9.read()` returns UTF-8 strings and cannot handle binary files. The function
+  uses `ctx.fs9.readBase64()` as a workaround (~33% size overhead).
+  A native `ctx.fs9.readBinary()` API is proposed in [issue #870](https://github.com/c4pt0r/db9-backend/issues/870).
+- See [`function_test_report.md`](function_test_report.md) for bugs found during development.
