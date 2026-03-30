@@ -139,6 +139,53 @@ await ctx.db.query(
 
 ## 最终架构
 
+### 方案 A：fs9 直接文件访问（推荐，`src/index-fs9.ts`）
+
+PRs #859 和 #869 修复了 `ctx.fs9.write` 和 `ctx.fs9.readBase64` 后，可以完全绕过 SQL，直接操作 db9 文件系统。
+
+```
+db9 fs cp file.xlsx myapp:/uploads/
+          │
+          ▼
+   /uploads/file.xlsx   (db9 fs9 filesystem)
+          │  ctx.fs9.readBase64()  ← base64 绕道（Bug 11）
+          ▼
+xlsx-csv function (db9 serverless, 7.5 KB bundle)
+  readZip() → parseWorkbook() → parseWorksheet() → toCsv()
+          │  ctx.fs9.write()
+          ▼
+   /output/file_Sheet.csv  (db9 fs9 filesystem)
+          │
+          ▼
+db9 fs cp myapp:/output/file_Sheet.csv ./
+```
+
+```bash
+# 1. 部署函数
+npm run build
+cat dist/index-fs9.js | db9 functions create xlsx-csv \
+  --database myapp \
+  --fs9-scope /uploads:ro \
+  --fs9-scope /output:rw
+
+# 2. 上传 xlsx
+db9 fs cp your_file.xlsx myapp:/uploads/your_file.xlsx
+
+# 3. 转换
+db9 functions invoke xlsx-csv --database myapp \
+  --payload '{"name": "your_file.xlsx"}'
+# → {"converted":[{"source":"your_file.xlsx","sheet":"Sales","path":"/output/your_file_Sales.csv","rows":6,"cols":5}],"errors":[]}
+
+# 4. 下载 CSV
+db9 fs cp myapp:/output/your_file_Sales.csv ./
+```
+
+---
+
+### 方案 B：SQL BYTEA 表（备用，`src/index.ts`）
+
+在 `ctx.fs9.write` / `ctx.fs9.readBase64` 不可用时的绕道方案。
+
 ```
 本地 xlsx 文件
   │  base64 编码后 INSERT
@@ -147,15 +194,13 @@ xlsx_staging 表 (BYTEA)
   │  ctx.db.query("SELECT encode(data,'base64') ...")
   ▼
 xlsx-csv function (db9 serverless, 7.5 KB bundle)
-  │  readZip() → parseWorkbook() → parseWorksheet() → toCsv()
+  readZip() → parseWorkbook() → parseWorksheet() → toCsv()
   ▼
 csv_output 表 (TEXT)
   │  db9 db sql -q "SELECT csv_content FROM csv_output WHERE ..."
   ▼
 用户下载 CSV
 ```
-
-### 完整使用示例
 
 ```bash
 # 1. 创建表
@@ -179,21 +224,18 @@ db9 db sql myapp -q "
   ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, uploaded_at = NOW()
 "
 
-# 3. 部署函数（首次）
+# 3. 部署函数
 npm run build
-cat dist/index.js | db9 functions create xlsx-csv --database myapp
+cat dist/index.js | db9 functions create xlsx-csv-sql --database myapp
 
 # 4. 转换
-db9 functions invoke xlsx-csv --database myapp --payload '{"name":"your_file.xlsx"}'
-# → {"converted":[{"source":"your_file.xlsx","sheet":"Sheet1","rows":6,"cols":5}],"errors":[]}
+db9 functions invoke xlsx-csv-sql --database myapp \
+  --payload '{"name":"your_file.xlsx"}'
 
 # 5. 下载 CSV
 db9 db sql myapp --output raw \
-  -q "SELECT csv_content FROM csv_output WHERE source_name='your_file.xlsx' AND sheet_name='Sheet1'" \
+  -q "SELECT csv_content FROM csv_output WHERE source_name='your_file.xlsx' AND sheet_name='Sales'" \
   > output.csv
-
-# 转换全部文件
-db9 functions invoke xlsx-csv --database myapp --payload '{"all":true}'
 ```
 
 ---
@@ -343,6 +385,19 @@ cp: /functions/<id>/file.txt: connection error: IO error: Connection refused (os
 
 ---
 
+#### Bug 11：`ctx.fs9` 无二进制读取 API，被迫使用 base64 绕道
+
+**重现**: [`repros/11-fs9-read-no-binary/README.md`](repros/11-fs9-read-no-binary/README.md)
+**Issue**: [c4pt0r/db9-backend#870](https://github.com/c4pt0r/db9-backend/issues/870)
+
+`ctx.fs9.read()` 只返回 UTF-8 字符串，无法读取二进制文件。`ctx.fs9.readBase64()` 是目前唯一的替代方案，但带来约 33% 的体积膨胀和额外的编解码开销。
+
+**根本原因**：function-service 与 fs9-server 之间的 WebSocket 协议使用 JSON 消息帧，JSON 无法原生携带二进制数据，因此服务端将文件内容转为 base64 字符串返回。WebSocket 原生支持 binary frame（`ArrayBuffer`），完全可以避免这一开销。
+
+**期望行为**：提供 `ctx.fs9.readBinary(path): Promise<Buffer>`，通过 WebSocket binary frame 传输，无需 base64。
+
+---
+
 ## 测试结果摘要
 
 | 功能 | 状态 | 备注 |
@@ -351,10 +406,13 @@ cp: /functions/<id>/file.txt: connection error: IO error: Connection refused (os
 | `ctx.db.query` SELECT / INSERT | ✅ 正常 | 行为数组（Bug 4）|
 | `ctx.fs9.list()` | ✅ 正常 | 返回绝对路径（Bug 5）|
 | `ctx.fs9.read()` 文本文件 | ✅ 正常 | |
-| `ctx.fs9.read()` 二进制文件 | ❌ 返回 null | Bug 2 |
-| `ctx.fs9.write()` | ❌ "missing content" | Bug 1 |
+| `ctx.fs9.read()` 二进制文件 | ❌ 返回 null | Bug 2（设计限制，见 Bug 11）|
+| `ctx.fs9.readBase64()` 二进制文件 | ✅ 正常 | PR #869 修复；base64 绕道（Bug 11）|
+| `ctx.fs9.write()` | ✅ 正常 | PR #869 修复（原 Bug 1）|
 | `fs9_read_bytea`（superuser SQL）| ✅ 正常 | |
 | `fs9_read_bytea`（authenticated）| ❌ 权限拒绝 | Bug 3 |
 | `fs9_read_bytea`（SECURITY DEFINER）| ❌ 权限拒绝 | Bug 3 |
-| `db9 functions create`（重新部署）| ❌ 名称冲突 | Bug 6 |
-| xlsx → CSV（最终方案）| ✅ **正常** | 使用 BYTEA 表输入 + csv_output 表输出 |
+| `db9 functions update` | ✅ 正常 | PR #862 修复（原 Bug 6）|
+| `db9 fs cp /dev/stdin` | ✅ 正常 | PR #862 修复（原 Bug 10）|
+| xlsx → CSV（fs9 方式）| ✅ **正常** | `src/index-fs9.ts`，staging 验证通过 |
+| xlsx → CSV（SQL 方式）| ✅ 正常 | `src/index.ts`，备用方案 |
